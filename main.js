@@ -1240,6 +1240,143 @@ $(document).ready(function () {
 
 })();
 
+// СТРАНИЦА ПРЕПОДАВАТЕЛЯ (hero-фото, программы, хлебные крошки)
+(function () {
+  'use strict';
+
+  var CFG = {
+    listUrl: 'https://store.tildaapi.com/api/getproductslist/?storepartuid=109845581152&getparts=true&getoptions=true&size=100&slice=1',
+    charTitle: 'Направление',   // название характеристики в карточке
+    splitter: /[,;\n]+/,        // разделитель программ внутри одного значения
+    avatar: 'https://static.tildacdn.com/tild3338-6162-4631-b730-393838373161/avatar.svg',
+    photoWidth: 1000,
+    cacheKey: 'teacher-data-v3',
+    timeout: 2500               // мс: не дождались данных — показываем как есть
+  };
+
+  function norm(s) {
+    return String(s || '').toLowerCase().replace(/ё/g, 'е').replace(/[^a-zа-я0-9]+/g, ' ').trim();
+  }
+  function pagePath(u) {
+    try { return new URL(u, location.origin).pathname.replace(/\/+$/, '').toLowerCase(); }
+    catch (e) { return ''; }
+  }
+  function flag(name) { document.documentElement.classList.add(name); }
+
+  function pickPhoto(p) {
+    var ed = p.editions && p.editions[0] && p.editions[0].img;
+    if (ed) return ed;
+    try { var g = JSON.parse(p.gallery || '[]'); return (g[0] && g[0].img) || ''; }
+    catch (e) { return ''; }
+  }
+
+  function optimize(src, w) {
+    var m = String(src).match(/^https?:\/\/static\.tildacdn\.com\/(.+)\/([^\/]+)$/);
+    if (!m || !/\.(jpe?g|png|webp)$/i.test(m[2])) return src;
+    var name = /\.webp$/i.test(m[2]) ? m[2] : m[2] + '.webp';
+    return 'https://optim.tildacdn.com/' + m[1] + '/-/resize/' + w + 'x/-/format/webp/' + name;
+  }
+
+  // Карта «путь страницы → {имя, фото, направления}»
+  function buildMap(data) {
+    var map = {};
+    (data.products || []).forEach(function (p) {
+      var path = pagePath(p.url);
+      if (!path) return;
+      var dirs = [];
+      (p.characteristics || []).forEach(function (c) {
+        if (norm(c.title) === norm(CFG.charTitle)) {
+          String(c.value || '').split(CFG.splitter).forEach(function (v) {
+            v = norm(v);
+            if (v && dirs.indexOf(v) === -1) dirs.push(v);
+          });
+        }
+      });
+      map[path] = { name: p.title || '', photo: pickPhoto(p), dirs: dirs };
+    });
+    return map;
+  }
+
+  // Фото в hero: оптимизированное → оригинал → аватар; ставим первое, что загрузилось
+  function renderPhoto(t) {
+    var img = document.querySelector('.uc-main-teachers img.t165__img');
+    if (!img) { flag('photo-ready'); return; }
+    if (t.name) img.alt = t.name;
+    var tries = t.photo ? [optimize(t.photo, CFG.photoWidth), t.photo, CFG.avatar] : [CFG.avatar];
+    (function next() {
+      var src = tries.shift();
+      if (!src) { flag('photo-ready'); return; }
+      var probe = new Image();
+      probe.onload = function () {
+        img.removeAttribute('srcset');   // иначе браузер может выбрать картинку из srcset шаблона
+        img.src = src;
+        img.setAttribute('data-original', /optim\.tildacdn/.test(src) ? t.photo : src);
+        flag('photo-ready');
+      };
+      probe.onerror = next;
+      probe.src = src;
+    })();
+  }
+
+  // Последняя «крошка» = текущая страница
+  function renderCrumbs(t) {
+    var last = document.querySelector('.uc-bread-crumbs .t758__list_item:last-child .t-menu__link-item');
+    if (last && t.name) {
+      last.textContent = t.name;
+      if (last.tagName === 'A') last.setAttribute('href', location.pathname);
+    }
+    flag('crumbs-ready');
+  }
+
+  function init() {
+    var all = [].slice.call(document.querySelectorAll('.uc-programs-slider .t1196__item'));
+    var holder = all.length ? all[0].parentNode : null;
+
+    function renderPrograms(dirs) {
+      if (!all.length) { flag('programs-ready'); return; }
+      var visible = all.filter(function (item) {
+        var t = item.querySelector('.t-card__title');
+        var title = norm(t ? t.textContent : '');
+        return dirs.some(function (d) { return title.indexOf(d) !== -1; });
+      });
+      if (!visible.length) {
+        console.warn('[teacher] нет совпадений для направлений:', dirs);
+        visible = all;
+      }
+      all.forEach(function (item) { if (visible.indexOf(item) === -1) item.remove(); });
+      visible.forEach(function (item) { holder.appendChild(item); });
+      flag('programs-ready');
+      window.dispatchEvent(new Event('resize'));   // пересчёт кнопок слайдера
+    }
+
+    function apply(t) { renderPrograms(t.dirs); renderPhoto(t); renderCrumbs(t); }
+    function giveUp() { flag('programs-ready'); flag('photo-ready'); flag('crumbs-ready'); }
+
+    var path = pagePath(location.href);
+    var cache = {};
+    try { cache = JSON.parse(localStorage.getItem(CFG.cacheKey)) || {}; } catch (e) {}
+
+    setTimeout(giveUp, CFG.timeout);
+
+    if (cache[path]) apply(cache[path]);   // мгновенно из кэша
+
+    fetch(CFG.listUrl)
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        var map = buildMap(data);
+        var fresh = map[path];
+        if (!fresh) { console.warn('[teacher] страница не найдена среди товаров:', path); giveUp(); return; }
+        if (JSON.stringify(fresh) !== JSON.stringify(cache[path])) apply(fresh);
+        try { localStorage.setItem(CFG.cacheKey, JSON.stringify(map)); } catch (e) {}
+      })
+      .catch(function (e) { console.warn('[teacher] ошибка загрузки', e); giveUp(); });
+  }
+
+  document.addEventListener('DOMContentLoaded', function () {
+    if (!document.querySelector('meta[name="teacher-page"]')) return;  // не страница преподавателя
+    setTimeout(init, 0);
+  });
+})();
 
 // ПОТОКИ | ПОДТЯГИВАЕМ ИНФУ С ТОВАРОВ В ПОТОКИ
 (function () {
