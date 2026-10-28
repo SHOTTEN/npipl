@@ -1378,416 +1378,474 @@ $(document).ready(function () {
   });
 })();
 
-// ПОТОКИ | ПОДТЯГИВАЕМ ИНФУ С ТОВАРОВ В ПОТОКИ
+// ПОТОКИ | ПРЕПОДАВАТЕЛИ В КАРТОЧКАХ И ПОПАПАХ ПОСТОВ
+// Источник: опции товаров-преподавателей (название = дисциплина, значения = ID постов)
+// Порядок преподавателей = порядок товаров в ответе API (как на странице преподавателей).
 (function () {
     'use strict';
 
     var CFG = {
-        marker: '.npipl-teacher',
+        root: '.uc-curriculum',
         api: 'https://store.tildaapi.com/api/getproductslist/?storepartuid=109845581152&getparts=true&getoptions=true&size=100&slice=1',
         avatar: 'https://static.tildacdn.com/tild3338-6162-4631-b730-393838373161/avatar.svg',
-        photoWidth: 1000
+        unavailable: '/service-unavailable',
+        photoWidth: 1000,
+        cacheKey: 'feed-teachers-v1',     // при смене формата кэша увеличьте номер версии
+        ttl: 6 * 60 * 60 * 1000,          // как часто перепроверять API
+        retryDelay: 5 * 60 * 1000         // пауза после неудачного запроса
     };
 
-    var productsPromise = null;
-    var products = {};
+    var CARD = 'li.js-feed-post';
+    var POPUP = '.t-feed__post-popup';
+    var MARK = 'data-feed-teachers-node';  // метка наших вставленных элементов
+    var CARD_FP = 'data-feed-teachers';    // отпечаток набора преподавателей поста
 
-    function normalizeName(value) {
-        return String(value || '')
-            .toLowerCase()
-            .replace(/ё/g, 'е')
-            .replace(/[.,;:!?()[\]"'«»]/g, ' ')
-            .replace(/\s+/g, ' ')
-            .trim()
-            .split(' ')
-            .sort()
-            .join(' ');
+    var index = null;                      // ID поста -> [преподаватели] по приоритету
+    var roots = [];
+    var warned = {};
+    var probes = {};
+
+    // ——— Утилиты ———
+
+    function warn(key, msg, extra) {
+        if (warned[key]) return;
+        warned[key] = 1;
+        if (extra === undefined) console.warn('[потоки] ' + msg);
+        else console.warn('[потоки] ' + msg, extra);
     }
 
-    function optimizePhoto(src) {
-        var match = String(src || '').match(
-            /^https?:\/\/static\.tildacdn\.com\/(.+)\/([^\/]+)$/
-        );
-
-        if (!match || !/\.(jpe?g|png|webp)$/i.test(match[2])) {
-            return src;
-        }
-
-        var name = /\.webp$/i.test(match[2])
-            ? match[2]
-            : match[2] + '.webp';
-
-        return 'https://optim.tildacdn.com/' +
-            match[1] +
-            '/-/resize/' +
-            CFG.photoWidth +
-            'x/-/format/webp/' +
-            name;
+    function hash(s) {
+        var h = 5381, i = s.length;
+        while (i) h = (h * 33) ^ s.charCodeAt(--i);
+        return (h >>> 0).toString(36);
     }
 
-    function getPhoto(product) {
-        if (
-            product.editions &&
-            product.editions[0] &&
-            product.editions[0].img
-        ) {
-            return product.editions[0].img;
-        }
+    function optimize(src) {
+        var m = String(src).match(/^https?:\/\/static\.tildacdn\.com\/(.+)\/([^\/]+)$/);
+        if (!m || !/\.(jpe?g|png|webp)$/i.test(m[2])) return src;
+        var name = /\.webp$/i.test(m[2]) ? m[2] : m[2] + '.webp';
+        return 'https://optim.tildacdn.com/' + m[1] + '/-/resize/' + CFG.photoWidth + 'x/-/format/webp/' + name;
+    }
 
+    function getPhoto(p) {
+        var e = p.editions && p.editions[0] && p.editions[0].img;
+        if (e) return e;
         try {
-            var gallery = JSON.parse(product.gallery || '[]');
-            return gallery[0] && gallery[0].img || '';
-        } catch (e) {
+            var g = JSON.parse(p.gallery || '[]');
+            return (g[0] && g[0].img) || '';
+        } catch (x) {
             return '';
         }
     }
 
-    function loadProducts() {
-        if (productsPromise) {
-            return productsPromise;
+    // Абсолютная ссылка (https://, http://, //) = у товара нет личной страницы
+    function resolveLink(raw) {
+        raw = String(raw || '').trim();
+        return (!raw || /^(?:[a-z][a-z0-9+.\-]*:)?\/\//i.test(raw)) ? CFG.unavailable : raw;
+    }
+
+    function probe(url) {
+        return probes[url] || (probes[url] = new Promise(function (resolve) {
+            var im = new Image();
+            im.onload = function () { resolve(true); };
+            im.onerror = function () { resolve(false); };
+            im.src = url;
+        }));
+    }
+
+    function setBg(el, url) {
+        el.setAttribute('data-original', url);
+        el.style.backgroundImage = 'url("' + url.replace(/"/g, '\\"') + '")';
+    }
+
+    function titleOf(li) {
+        var a = li.querySelector('.js-feed-post-link');
+        return a ? a.textContent.trim() : '(без названия)';
+    }
+
+    function postFp(list) {
+        return list.length ? hash(list.map(function (t) { return t.fp; }).join('|')) : 'none';
+    }
+
+    // ——— Данные и кэш ———
+
+    function parse(data) {
+        var out = [];
+
+        (data.products || []).forEach(function (p) {
+            var posts = [];
+
+            (p.properties || []).forEach(function (prop) {
+                String(prop.values || '').split(/[\r\n]+/).forEach(function (id) {
+                    id = id.trim();
+                    if (id) posts.push(id);
+                });
+            });
+
+            if (!posts.length) return;   // не привязан к постам: в кэш не берём
+
+            var name = String(p.title || '').trim();
+            if (!name) {
+                warn('noname:' + p.uid, 'У товара uid ' + p.uid + ' пустое название, преподаватель пропущен');
+                return;
+            }
+
+            var t = {
+                name: name,
+                photo: getPhoto(p),
+                descr: String(p.descr || '').trim(),   // как текст, не HTML
+                link: resolveLink(p.buttonlink || p.url),
+                posts: posts
+            };
+            t.fp = hash(JSON.stringify([t.name, t.photo, t.descr, t.link, t.posts]));
+            out.push(t);
+        });
+
+        return out;
+    }
+
+    function setData(list) {
+        index = Object.create(null);
+        list.forEach(function (t) {
+            t.posts.forEach(function (id) {
+                var a = index[id] || (index[id] = []);
+                if (a.indexOf(t) === -1) a.push(t);
+            });
+        });
+    }
+
+    function readCache() {
+        try {
+            var raw = localStorage.getItem(CFG.cacheKey);
+            if (!raw) return null;
+            var c = JSON.parse(raw);
+            return (c && Array.isArray(c.teachers)) ? c : null;
+        } catch (e) {
+            warn('cache-read', 'Не удалось прочитать кэш, данные будут загружены заново:', e);
+            return null;
         }
+    }
 
-        productsPromise = fetch(CFG.api)
-            .then(function (response) {
-                if (!response.ok) {
-                    throw new Error('HTTP ' + response.status);
-                }
+    function writeCache(c) {
+        try {
+            localStorage.setItem(CFG.cacheKey, JSON.stringify(c));
+        } catch (e) {
+            warn('cache-write', 'Не удалось записать кэш (localStorage недоступен?):', e);
+        }
+    }
 
-                return response.json();
+    function refresh(cache) {
+        fetch(CFG.api)
+            .then(function (r) {
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return r.json();
             })
             .then(function (data) {
-                (data.products || []).forEach(function (product) {
-                    var key = normalizeName(product.title);
-
-                    if (!key) return;
-
-                    if (!products[key]) {
-                        products[key] = [];
-                    }
-
-                    products[key].push(product);
-                });
-
-                return products;
-            })
-            .catch(function (error) {
-                console.warn(
-                    '[NPIPL teachers] Не удалось загрузить данные преподавателей:',
-                    error
-                );
-
-                throw error;
-            });
-
-        return productsPromise;
-    }
-
-    function createTeacher(product) {
-        var wrapper = document.createElement('div');
-        wrapper.className = 'npipl-teacher__content';
-
-        var photo = getPhoto(product) || CFG.avatar;
-
-        // Фото
-        var figure = document.createElement('figure');
-
-        var image = document.createElement('img');
-        image.src = optimizePhoto(photo);
-        image.alt = product.title || 'Преподаватель';
-        image.loading = 'lazy';
-        image.decoding = 'async';
-
-        figure.appendChild(image);
-        wrapper.appendChild(figure);
-
-        // ФИО
-        var name = document.createElement('h4');
-        name.className = 't-redactor__h4';
-        name.textContent = product.title || '';
-        wrapper.appendChild(name);
-
-        // Описание
-        if (product.descr) {
-            var description = document.createElement('div');
-            description.className = 't-redactor__text';
-            description.textContent = product.descr;
-            wrapper.appendChild(description);
-        }
-
-        // Ссылка «Подробнее»
-        var linkUrl = product.buttonlink || product.url;
-
-        if (linkUrl) {
-            var link = document.createElement('a');
-
-            link.className =
-                't-feed__post-popup__btn t-btn btn-s btn-style-accent-ghost';
-
-            link.href = linkUrl;
-
-            var linkText = document.createElement('span');
-            linkText.className = 't-feed__post-popup__btn-text';
-            linkText.textContent = 'Подробнее';
-
-            var svg = document.createElementNS(
-                'http://www.w3.org/2000/svg',
-                'svg'
-            );
-
-            svg.setAttribute('viewBox', '0 0 24 24');
-
-            svg.innerHTML =
-                '<path d="M15.3887 16.8193L19.4551 12.7529H2.0166V11.2529H19.4551L15.3887 7.18652L16.4492 6.125L21.7959 11.4727C21.9365 11.6133 21.9365 11.8041 21.7959 11.9447L16.4492 17.8799L15.3887 16.8193Z" fill="currentColor"></path>';
-
-            link.appendChild(linkText);
-            link.appendChild(svg);
-            wrapper.appendChild(link);
-        }
-
-        return wrapper;
-    }
-
-    function render() {
-        var markers = document.querySelectorAll(
-            CFG.marker + ':not([data-npipl-rendered])'
-        );
-
-        if (!markers.length) return;
-
-        loadProducts()
-            .then(function () {
-                Array.prototype.forEach.call(markers, function (marker) {
-                    var teacherName = marker.getAttribute('data-teacher');
-
-                    if (!teacherName) {
-                        marker.setAttribute(
-                            'data-npipl-rendered',
-                            'error'
-                        );
-                        return;
-                    }
-
-                    var matches = products[normalizeName(teacherName)];
-
-                    if (!matches || !matches.length) {
-                        console.warn(
-                            '[NPIPL teachers] Преподаватель не найден:',
-                            teacherName
-                        );
-
-                        marker.setAttribute(
-                            'data-npipl-rendered',
-                            'error'
-                        );
-
-                        return;
-                    }
-
-                    if (matches.length > 1) {
-                        console.warn(
-                            '[NPIPL teachers] Найдено несколько преподавателей:',
-                            teacherName
-                        );
-
-                        marker.setAttribute(
-                            'data-npipl-rendered',
-                            'error'
-                        );
-
-                        return;
-                    }
-
-                    marker.appendChild(
-                        createTeacher(matches[0])
-                    );
-
-                    marker.setAttribute(
-                        'data-npipl-rendered',
-                        '1'
-                    );
-                });
-            })
-            .catch(function () {
-                // Ошибка API не должна ломать страницу.
-            });
-    }
-
-    function init() {
-        render();
-
-        // Tilda Feed создаёт popup динамически.
-        var observer = new MutationObserver(function (mutations) {
-            var needRender = false;
-
-            for (var i = 0; i < mutations.length && !needRender; i++) {
-                var nodes = mutations[i].addedNodes;
-
-                for (var j = 0; j < nodes.length; j++) {
-                    var node = nodes[j];
-
-                    if (node.nodeType !== 1) continue;
-
-                    if (
-                        node.matches &&
-                        node.matches(CFG.marker)
-                    ) {
-                        needRender = true;
-                        break;
-                    }
-
-                    if (
-                        node.querySelector &&
-                        node.querySelector(CFG.marker)
-                    ) {
-                        needRender = true;
-                        break;
-                    }
+                if (!data || !Array.isArray(data.products) || !data.products.length) {
+                    throw new Error('API вернул пустой список товаров');
                 }
-            }
-
-            if (needRender) {
-                render();
-            }
-        });
-
-        observer.observe(document.body, {
-            childList: true,
-            subtree: true
-        });
-    }
-
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', init);
-    } else {
-        init();
-    }
-
-})();
-
-// ПОТОКИ | ФОТО ПРЕПОДАВАТЕЛЯ НА КАРТОЧКЕ ПОСТА (компактная версия)
-(function () {
-    'use strict';
-    var C = {
-        root: '.uc-curriculum .t-feed__col-grid__post-wrapper',
-        api: 'https://store.tildaapi.com/api/getproductslist/?storepartuid=109845581152&getparts=true&getoptions=true&size=100&slice=1',
-        avatar: 'https://static.tildacdn.com/tild3338-6162-4631-b730-393838373161/avatar.svg'
-    };
-    var P = {}, req = null, sch = false, W = {};
-
-    function warn(k, t, d) {
-        if (W[k]) return;
-        W[k] = 1;
-        console.warn('[NPIPL feed photo] ' + t, d);
-    }
-
-    function norm(v) {
-        return String(v || '').toLowerCase().replace(/ё/g, 'е')
-            .replace(/[.,;:!?()[\]"'«»]/g, ' ').replace(/\s+/g, ' ')
-            .trim().split(' ').sort().join(' ');
-    }
-
-    function photo(p) {
-        var e = p.editions && p.editions[0] && p.editions[0].img;
-        if (e) return e;
-        try { var g = JSON.parse(p.gallery || '[]'); return (g[0] && g[0].img) || ''; }
-        catch (x) { return ''; }
-    }
-
-    function opt(src) {
-        var m = String(src).match(/^https?:\/\/static\.tildacdn\.com\/(.+)\/([^\/]+)$/);
-        if (!m || !/\.(jpe?g|png|webp)$/i.test(m[2])) return src;
-        var n = /\.webp$/i.test(m[2]) ? m[2] : m[2] + '.webp';
-        return 'https://optim.tildacdn.com/' + m[1] + '/-/resize/1000x/-/format/webp/' + n;
-    }
-
-    function load() {
-        if (req) return req;
-        req = fetch(C.api).then(function (r) {
-            if (!r.ok) throw new Error('HTTP ' + r.status);
-            return r.json();
-        }).then(function (d) {
-            (d.products || []).forEach(function (p) {
-                var k = norm(p.title);
-                if (k) (P[k] = P[k] || []).push(p);
+                return parse(data);
+            })
+            .then(function (list) {
+                if (!list.length) {
+                    warn('nolinks', 'Ни у одного преподавателя нет привязки к постам: проверьте опции товаров');
+                }
+                setData(list);
+                writeCache({ checkedAt: Date.now(), teachers: list });
+                sweep();   // перерисуются только посты, у которых изменился отпечаток
+            }, function (e) {
+                warn('fetch', 'Не удалось загрузить данные преподавателей' +
+                    (cache ? ' (используются данные из кэша):' : ':'), e);
+                if (cache) {
+                    cache.retryAt = Date.now() + CFG.retryDelay;
+                    writeCache(cache);
+                }
             });
-        }).catch(function (e) {
-            console.warn('[NPIPL feed photo] Не удалось загрузить данные преподавателей:', e);
-            throw e;
-        });
-        return req;
     }
 
-    function names(card) {
-        var d = card.querySelector('.js-feed-post-descr');
-        if (!d) return [];
-        return d.innerHTML.split(/<br\s*\/?>/i).map(function (s) {
-            var t = document.createElement('div');
-            t.innerHTML = s;
-            return (t.textContent || '').trim();
-        }).filter(Boolean);
-    }
+    // ——— Карточка поста ———
 
-    function setBg(el, u) {
-        el.setAttribute('data-original', u);
-        el.style.backgroundImage = 'url("' + u.replace(/"/g, '\\"') + '")';
-    }
-
-    function proc(card) {
-        if (card.querySelector('.t-feed__post-imgwrapper')) return;
+    function ensureImage(wrap) {
+        var own = wrap.querySelector('.t-feed__post-imgwrapper[' + MARK + ']');
+        if (own) return own.querySelector('.t-feed__post-bgimg');
+        if (wrap.querySelector('.t-feed__post-imgwrapper')) return null;   // у поста своя обложка
 
         var w = document.createElement('div');
         w.className = 't-feed__post-imgwrapper t-feed__post-imgwrapper_beforetitle';
+        w.setAttribute(MARK, '');
+
         var bg = document.createElement('div');
         bg.className = 't-feed__post-bgimg t-bgimg loaded';
-        setBg(bg, C.avatar);
+        setBg(bg, CFG.avatar);
+
         w.appendChild(bg);
-        card.insertBefore(w, card.firstChild);
+        wrap.insertBefore(w, wrap.firstChild);
+        return bg;
+    }
 
-        var a = card.querySelector('.js-feed-post-link');
-        var title = a ? a.textContent.trim() : '(без названия)';
-        var ns = names(card);
+    function setDescr(li, list) {
+        var d = li.querySelector('.js-feed-post-descr');
 
-        if (!ns.length) {
-            warn('e:' + title, 'В описании поста нет преподавателей, показан аватар:', title);
+        if (!d) {
+            var box = li.querySelector('.t-feed__textwrapper');
+            if (!box) {
+                warn('notext', 'В карточке поста не найден .t-feed__textwrapper, описание не вставлено');
+                return;
+            }
+            d = document.createElement('div');
+            d.className = 'js-feed-post-descr t-feed__post-descr t-descr t-descr_xxs';
+            box.appendChild(d);
+        }
+
+        d.textContent = '';
+        list.forEach(function (t, i) {
+            if (i) d.appendChild(document.createElement('br'));
+            d.appendChild(document.createTextNode(t.name));
+        });
+    }
+
+    function setPhoto(li, bg, list, fp, id) {
+        setBg(bg, CFG.avatar);
+
+        var urls = [];
+        list.forEach(function (t) {
+            if (!t.photo) return;
+            var o = optimize(t.photo);
+            urls.push(o);
+            if (o !== t.photo) urls.push(t.photo);   // запасной вариант: оригинал
+        });
+
+        if (!urls.length) {
+            warn('nophoto:' + id, 'У всех преподавателей поста «' + titleOf(li) + '» нет фото, показан аватар');
             return;
         }
 
-        load().then(function () {
-            var url = '';
-            for (var i = 0; i < ns.length && !url; i++) {
-                var m = P[norm(ns[i])], why = '';
-                if (!m || !m.length) why = 'преподаватель не найден';
-                else if (m.length > 1) why = 'найдено несколько преподавателей';
-                else if (!photo(m[0])) why = 'у преподавателя нет фото';
-                else url = opt(photo(m[0]));
-                if (why) warn('n:' + ns[i] + why, 'Пост «' + title + '»: ' + why + ':', ns[i]);
-            }
-            if (!url) {
-                warn('a:' + title, 'Не удалось подобрать фото, показан аватар:', title);
+        (function next(i) {
+            if (i >= urls.length) {
+                warn('allfail:' + id, 'Ни одно фото преподавателей поста «' + titleOf(li) + '» не загрузилось, показан аватар');
                 return;
             }
-            var img = new Image();
-            img.onload = function () { setBg(bg, url); };
-            img.src = url;
-        }).catch(function () {});
+            probe(urls[i]).then(function (ok) {
+                if (li.getAttribute(CARD_FP) !== fp) return;   // карточку уже перерисовали
+                if (ok) { setBg(bg, urls[i]); return; }
+                warn('badimg:' + urls[i], 'Фото не загрузилось:', urls[i]);
+                next(i + 1);
+            });
+        })(0);
     }
 
-    function render() {
-        sch = false;
-        Array.prototype.forEach.call(document.querySelectorAll(C.root), proc);
+    function renderCard(li) {
+        var wrap = li.querySelector('.t-feed__col-grid__post-wrapper');
+        if (!wrap) {
+            warn('nowrap', 'В карточке поста не найден .t-feed__col-grid__post-wrapper: разметка Tilda изменилась?');
+            return;
+        }
+
+        var bg = ensureImage(wrap);   // заглушка сразу, чтобы вёрстка не прыгала
+        if (!index) return;           // данных ещё нет, дорисуем, когда придут
+
+        var id = li.getAttribute('data-post-uid');
+        if (!id) {
+            warn('nouid', 'У карточки поста нет data-post-uid');
+            return;
+        }
+
+        var list = index[id] || [];
+        var fp = postFp(list);
+        if (li.getAttribute(CARD_FP) === fp) return;   // уже актуально
+        li.setAttribute(CARD_FP, fp);
+
+        if (!list.length) {
+            warn('empty:' + id, 'Пост «' + titleOf(li) + '» (' + id + '): не найдено ни одного преподавателя, проверьте ID в опциях карточек преподавателей');
+            return;
+        }
+
+        setDescr(li, list);
+        if (bg) setPhoto(li, bg, list, fp, id);
     }
 
-    function init() {
-        var r = document.querySelector('.uc-curriculum');
-        if (!r) return;
-        new MutationObserver(function () {
-            if (sch) return;
-            sch = true;
-            requestAnimationFrame(render);
-        }).observe(r, { childList: true, subtree: true });
-        render();
+    // ——— Попап поста ———
+
+    function teacherBlock(t) {
+        var box = document.createElement('div');
+        box.className = 't-redactor__embedcode';
+        box.setAttribute(MARK, '');
+
+        var wrap = document.createElement('div');
+        wrap.className = 'npipl-teacher';
+
+        var content = document.createElement('div');
+        content.className = 'npipl-teacher__content';
+
+        var fig = document.createElement('figure');
+        var img = document.createElement('img');
+        img.src = t.photo ? optimize(t.photo) : CFG.avatar;
+        img.alt = t.name;
+        img.loading = 'lazy';
+        img.decoding = 'async';
+        img.onerror = function () {
+            img.onerror = null;
+            warn('img:' + t.name, 'Фото преподавателя «' + t.name + '» не загрузилось, показан аватар:', img.src);
+            img.src = CFG.avatar;
+        };
+        fig.appendChild(img);
+        content.appendChild(fig);
+
+        var h4 = document.createElement('h4');
+        h4.className = 't-redactor__h4';
+        h4.textContent = t.name;
+        content.appendChild(h4);
+
+        if (t.descr) {
+            var d = document.createElement('div');
+            d.className = 't-redactor__text';
+            d.textContent = t.descr;
+            content.appendChild(d);
+        }
+
+        if (t.link === CFG.unavailable) {
+            warn('nopage:' + t.name, 'У преподавателя «' + t.name + '» нет личной страницы, кнопка «Подробнее» ведёт на ' + CFG.unavailable);
+        }
+
+        var a = document.createElement('a');
+        a.className = 't-feed__post-popup__btn t-btn btn-s btn-style-accent-ghost';
+        a.href = t.link;
+        a.innerHTML = '<span class="t-feed__post-popup__btn-text">Подробнее</span>' +
+            '<svg viewBox="0 0 24 24"><path d="M15.3887 16.8193L19.4551 12.7529H2.0166V11.2529H19.4551L15.3887 7.18652L16.4492 6.125L21.7959 11.4727C21.9365 11.6133 21.9365 11.8041 21.7959 11.9447L16.4492 17.8799L15.3887 16.8193Z" fill="currentColor"></path></svg>';
+        content.appendChild(a);
+
+        wrap.appendChild(content);
+        box.appendChild(wrap);
+        return box;
     }
 
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
-    else init();
+    function divider() {
+        var f = document.createElement('figure');
+        f.setAttribute('contenteditable', 'false');
+        f.setAttribute(MARK, '');
+        f.innerHTML = '<hr style="color: var(--border-accent);">';
+        return f;
+    }
+
+    // Текст попапа подгружается асинхронно: если через 2 с его всё нет, предупреждаем
+    function waitText(popup, id) {
+        if (popup.feedTeachersWait === id) return;
+        popup.feedTeachersWait = id;
+        setTimeout(function () {
+            if (document.contains(popup) &&
+                popup.getAttribute('data-feed-popup-postuid') === id &&
+                !popup.querySelector('.js-feed-post-text .t-redactor__tte-view')) {
+                warn('notte:' + id, 'В попапе поста ' + id + ' нет текста (.t-redactor__tte-view), блок преподавателей не вставлен');
+            }
+        }, 2000);
+    }
+
+    function renderPopup(popup) {
+        // Вне .uc-curriculum (страница поста, чужие ленты) предупреждения не выводим
+        var quiet = !popup.closest(CFG.root);
+
+        var id = popup.getAttribute('data-feed-popup-postuid');
+        if (!id) {
+            if (!quiet) warn('popup-nouid', 'У попапа нет data-feed-popup-postuid, не удалось определить пост');
+            return;
+        }
+
+        var tte = popup.querySelector('.js-feed-post-text .t-redactor__tte-view');
+        if (!tte) { if (!quiet) waitText(popup, id); return; }
+        if (!index) return;
+
+        var list = index[id] || [];
+        var fp = postFp(list);
+
+        var first = tte.firstElementChild;
+        if (first && first.getAttribute(MARK) === fp) return;   // уже актуально
+
+        // Убираем наш прежний блок (если был)
+        Array.prototype.slice.call(tte.children).forEach(function (k) {
+            if (k.hasAttribute(MARK)) tte.removeChild(k);
+        });
+
+        if (!list.length) {
+            if (!quiet) warn('popup-empty:' + id, 'Попап поста ' + id + ': не найдено ни одного преподавателя, проверьте ID в опциях карточек преподавателей');
+            return;
+        }
+
+        var frag = document.createDocumentFragment();
+
+        var h2 = document.createElement('h2');
+        h2.className = 't-redactor__h2';
+        h2.setAttribute(MARK, fp);   // по значению определяем, что блок актуален
+        h2.textContent = list.length > 1 ? 'Преподаватели' : 'Преподаватель';
+        frag.appendChild(h2);
+
+        list.forEach(function (t) {
+            frag.appendChild(teacherBlock(t));
+            frag.appendChild(divider());
+        });
+
+        tte.insertBefore(frag, tte.firstChild);
+    }
+
+    // ——— Обход DOM ———
+
+    function handle(node) {
+        if (!node || node.nodeType !== 1 || node.hasAttribute(MARK)) return;
+
+        if (node.matches(CARD)) renderCard(node);
+        else Array.prototype.forEach.call(node.querySelectorAll(CARD), renderCard);
+
+        var popup = node.closest(POPUP);
+        if (popup) renderPopup(popup);
+        else Array.prototype.forEach.call(node.querySelectorAll(POPUP), renderPopup);
+    }
+
+    function sweep() {
+        roots.forEach(handle);
+    }
+
+    // Корни наблюдения: потоки (.uc-curriculum) и отдельные страницы поста
+    function findRoots() {
+        var list = Array.prototype.slice.call(document.querySelectorAll(CFG.root));
+
+        // Страница поста (/tpost/...): попап лежит вне .uc-curriculum, наблюдаем за его родителем
+        Array.prototype.forEach.call(document.querySelectorAll(POPUP), function (p) {
+            var r = p.parentNode;
+            if (!p.closest(CFG.root) && list.indexOf(r) === -1) list.push(r);
+        });
+
+        return list;
+    }
+
+    function start() {
+        roots = findRoots();
+        if (!roots.length) return;   // нет ни потоков, ни попапа поста: запросов нет
+
+        var cache = readCache();
+        if (cache) setData(cache.teachers);
+
+        roots.forEach(function (root) {
+            handle(root);
+
+            // Колбэк выполняется до отрисовки кадра: при готовых данных мерцания нет
+            new MutationObserver(function (records) {
+                records.forEach(function (r) {
+                    if (r.type === 'attributes') renderPopup(r.target);
+                    else Array.prototype.forEach.call(r.addedNodes, handle);
+                });
+            }).observe(root, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['data-feed-popup-postuid']
+            });
+        });
+
+        var now = Date.now();
+        var stale = !cache ||
+            (now - (cache.checkedAt || 0) >= CFG.ttl && now >= (cache.retryAt || 0));
+        if (stale) refresh(cache);
+    }
+
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
+    else start();
 })();
