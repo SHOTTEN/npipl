@@ -36,7 +36,7 @@
     const elementsToAddWhiteBlock = ["#rec1168902126 ul.t503__container li", ".uc-about_program ul.t491__container li"];
     const elementsToAddContainerFluid = [".uc-mission .t165", ".uc-accent-header .t795", ".t975__wrapper", "#rec1168902126 .t503", ".uc-about_program .t491", "#rec1267432761 .t117", "#rec1282526171 .t431 > div"]; 
     const elementsToAddContainer = [".t958__gallery", "#rec1255516271 .t774__container", ".uc-curriculum .t897__container", ".uc-events-slider .t1196__items", "#rec1527650641 .t165"]; // , ".uc-programs-slider .t1196__controls"
-    const elementsToAddTextT1 = [".t165__text", ".uc-descHeroHeader .t-text", "#rec1191010491 .t-text", ".uc-specifications-02 .t-descr", "#rec1260268831 .t572__text", ".uc-t1 .t-text", ".t185__text"]; // , ".t958__review-text"
+    const elementsToAddTextT1 = [".t165__text", ".uc-descHeroHeader .t-text", "#rec1191010491 .t-text", ".uc-specifications-01 .t-descr", "#rec1260268831 .t572__text", ".uc-t1 .t-text", ".t185__text"]; // , ".t958__review-text"
     const elementsToAddButtonS = [".t794__typo", ".uc-events-slider .t-btn"];
     const elementsToAddButtonM = [".t-btnflex_md", ".t481 .t-menu__link-item", "#rec1255516271 .t-btn"]; //, ".uc-programs-slider a.t-btn"
     const elementsToAddButtonL = [".uc-main-block .t-btn", ".uc-main-teachers .t-btn"];
@@ -1057,6 +1057,222 @@ $(document).ready(function () {
 });
 
 
+// ПРЕПОДАВАТЕЛИ | ОБЩЕЕ ХРАНИЛИЩЕ ДАННЫХ (один запрос и один кэш на все страницы сайта)
+(function () {
+    'use strict';
+
+    var CFG = {
+        api: 'https://store.tildaapi.com/api/getproductslist/?storepartuid=109845581152&getparts=true&getoptions=true&size=100&slice=1',
+        cacheKey: 'npipl-teachers-v1',                      // при смене формата кэша увеличьте версию
+        oldKeys: ['teacher-data-v3', 'feed-teachers-v1'],   // кэши прежних скриптов: удаляем
+        ttl: 6 * 60 * 60 * 1000,                            // как часто перепроверять API
+        retryDelay: 5 * 60 * 1000,                          // пауза после неудачного запроса
+        forceGap: 60 * 1000                                 // принудительная проверка не чаще раза в минуту
+    };
+
+    var store = null;                  // {list, byUid, byPath, byPost}; null, пока данных нет
+    var meta = { checkedAt: 0, retryAt: 0 };
+    var subs = [];
+    var warned = {};
+    var fetching = false;
+
+    function warn(key, msg, extra) {
+        if (warned[key]) return;
+        warned[key] = 1;
+        if (extra === undefined) console.warn('[преподаватели] ' + msg);
+        else console.warn('[преподаватели] ' + msg, extra);
+    }
+
+    function hash(s) {
+        var h = 5381, i = s.length;
+        while (i) h = (h * 33) ^ s.charCodeAt(--i);
+        return (h >>> 0).toString(36);
+    }
+
+    function pagePath(u) {
+        if (!u) return '';
+        try { return new URL(u, location.origin).pathname.replace(/\/+$/, '').toLowerCase(); }
+        catch (e) { return ''; }
+    }
+
+    function getPhoto(p) {
+        var e = p.editions && p.editions[0] && p.editions[0].img;
+        if (e) return e;
+        try {
+            var g = JSON.parse(p.gallery || '[]');
+            return (g[0] && g[0].img) || '';
+        } catch (x) {
+            return '';
+        }
+    }
+
+    // Ответ API -> компактный список в порядке товаров (= порядок на странице преподавателей)
+    function parse(data) {
+        var out = [];
+
+        (data.products || []).forEach(function (p) {
+            var uid = String(p.uid || '');
+            if (!uid) return;
+
+            var programs = [], posts = [];
+            (p.properties || []).forEach(function (prop) {
+                var title = String(prop.title || '').trim();
+                if (title && programs.indexOf(title) === -1) programs.push(title);
+
+                String(prop.values || '').split(/[\r\n]+/).forEach(function (id) {
+                    id = id.trim();
+                    if (id) posts.push(id);
+                });
+            });
+
+            var t = {
+                uid: uid,
+                name: String(p.title || '').trim(),
+                photo: getPhoto(p),
+                descr: String(p.descr || '').trim(),
+                mark: String(p.mark || '').trim(),
+                url: String(p.url || ''),
+                buttonlink: String(p.buttonlink || ''),
+                programs: programs,   // названия опций = программы/дисциплины
+                posts: posts          // ID постов
+            };
+            t.fp = hash(JSON.stringify([t.name, t.photo, t.descr, t.mark, t.url, t.buttonlink, t.programs, t.posts]));
+            out.push(t);
+        });
+
+        return out;
+    }
+
+    // Индексы: по uid товара, по пути страницы и по ID поста
+    function build(list) {
+        var s = {
+            list: list,
+            byUid: Object.create(null),
+            byPath: Object.create(null),
+            byPost: Object.create(null)
+        };
+
+        list.forEach(function (t) {
+            s.byUid[t.uid] = t;
+
+            [t.url, t.buttonlink].forEach(function (u) {
+                var path = pagePath(u);
+                if (path && !s.byPath[path]) s.byPath[path] = t;
+            });
+
+            if (!t.posts.length) return;
+            if (!t.name) {
+                warn('noname:' + t.uid, 'У товара uid ' + t.uid + ' пустое название, в потоках он показан не будет');
+                return;
+            }
+            t.posts.forEach(function (id) {
+                var a = s.byPost[id] || (s.byPost[id] = []);
+                if (a.indexOf(t) === -1) a.push(t);
+            });
+        });
+
+        return s;
+    }
+
+    function writeCache() {
+        try {
+            localStorage.setItem(CFG.cacheKey, JSON.stringify({
+                checkedAt: meta.checkedAt,
+                retryAt: meta.retryAt,
+                teachers: store ? store.list : []
+            }));
+        } catch (e) {
+            warn('cache-write', 'Не удалось записать кэш (localStorage недоступен?):', e);
+        }
+    }
+
+    function notify(changed) {
+        subs.slice().forEach(function (fn) {
+            try { fn(store, changed); }
+            catch (e) { console.error('[преподаватели] ошибка в подписчике:', e); }
+        });
+    }
+
+    function refresh() {
+        fetching = true;
+
+        fetch(CFG.api)
+            .then(function (r) {
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return r.json();
+            })
+            .then(function (data) {
+                if (!data || !Array.isArray(data.products) || !data.products.length) {
+                    throw new Error('API вернул пустой список товаров');
+                }
+
+                var list = parse(data);
+                var prev = {}, changed = {}, any = false;
+                if (store) store.list.forEach(function (t) { prev[t.uid] = t.fp; });
+
+                list.forEach(function (t) {
+                    if (prev[t.uid] !== t.fp) { changed[t.uid] = true; any = true; }
+                    delete prev[t.uid];
+                });
+                Object.keys(prev).forEach(function (uid) { changed[uid] = true; any = true; });   // удалённые
+
+                var first = !store;
+                store = build(list);
+                meta.checkedAt = Date.now();
+                meta.retryAt = 0;
+                writeCache();
+
+                if (first || any) notify(changed);   // без изменений подписчиков не трогаем
+            })
+            .catch(function (e) {
+                warn('fetch', 'Не удалось загрузить данные преподавателей' +
+                    (store ? ' (используются данные из кэша):' : ':'), e);
+                meta.retryAt = Date.now() + CFG.retryDelay;
+                if (store) writeCache();
+            })
+            .then(function () { fetching = false; });
+    }
+
+    // force = true: проверить, не устарел ли кэш досрочно (например, не найден нужный преподаватель)
+    function ensure(force) {
+        if (fetching) return;
+        var now = Date.now();
+        if (now < meta.retryAt) return;
+        if (store && now - meta.checkedAt < (force ? CFG.forceGap : CFG.ttl)) return;
+        refresh();
+    }
+
+    function init() {
+        try {
+            CFG.oldKeys.forEach(function (k) { localStorage.removeItem(k); });
+        } catch (e) {}
+
+        try {
+            var c = JSON.parse(localStorage.getItem(CFG.cacheKey));
+            if (c && Array.isArray(c.teachers) && c.teachers.length) {
+                store = build(c.teachers);
+                meta.checkedAt = c.checkedAt || 0;
+                meta.retryAt = c.retryAt || 0;
+            }
+        } catch (e) {
+            warn('cache-read', 'Не удалось прочитать кэш, данные будут загружены заново:', e);
+        }
+    }
+
+    init();
+
+    window.npiplTeachers = {
+        peek: function () { return store; },                   // данные из памяти/кэша или null
+        ensure: ensure,                                        // обновить, если кэш устарел
+        onUpdate: function (fn) { subs.push(fn); },            // fn(store, {uid: true, ...}) при новых данных
+        reset: function () {                                   // ручной сброс кэша (вызывать из консоли)
+            try { localStorage.removeItem(CFG.cacheKey); } catch (e) {}
+            meta.checkedAt = 0;
+            meta.retryAt = 0;
+            console.log('[преподаватели] кэш сброшен, перезагрузите страницу');
+        }
+    };
+})();
 
 // ОБЩАЯ СТРАНИЦА С ПРЕПОДАВАТЕЛЯМИ (вставка аватара, если нет фото)
 (function () {
@@ -1065,179 +1281,118 @@ $(document).ready(function () {
     var CFG = {
         root: '.uc-teachers',
         card: '.js-product.t-store__card',
-        api: 'https://store.tildaapi.com/api/getproductslist/?storepartuid=109845581152&getparts=true&getoptions=true&size=100&slice=1',
         avatar: 'https://static.tildacdn.com/tild3338-6162-4631-b730-393838373161/avatar.svg',
         photoWidth: 1000
     };
 
-    var root;
-    var products = {};
+    var root, T;
     var renderScheduled = false;
+    var forced = false;
+    var warned = {};
+
+    function warn(key, msg, extra) {
+        if (warned[key]) return;
+        warned[key] = 1;
+        console.warn('[teachers] ' + msg, extra === undefined ? '' : extra);
+    }
 
     function optimize(src) {
-        var match = String(src).match(
-            /^https?:\/\/static\.tildacdn\.com\/(.+)\/([^\/]+)$/
-        );
-
-        if (!match || !/\.(jpe?g|png|webp)$/i.test(match[2])) {
-            return src;
-        }
-
-        var name = /\.webp$/i.test(match[2])
-            ? match[2]
-            : match[2] + '.webp';
-
-        return 'https://optim.tildacdn.com/' +
-            match[1] +
-            '/-/resize/' +
-            CFG.photoWidth +
-            'x/-/format/webp/' +
-            name;
+        var match = String(src).match(/^https?:\/\/static\.tildacdn\.com\/(.+)\/([^\/]+)$/);
+        if (!match || !/\.(jpe?g|png|webp)$/i.test(match[2])) return src;
+        var name = /\.webp$/i.test(match[2]) ? match[2] : match[2] + '.webp';
+        return 'https://optim.tildacdn.com/' + match[1] + '/-/resize/' + CFG.photoWidth + 'x/-/format/webp/' + name;
     }
 
-    function getPhoto(product) {
-        var edition = product.editions &&
-            product.editions[0] &&
-            product.editions[0].img;
-
-        if (edition) return edition;
-
-        try {
-            var gallery = JSON.parse(product.gallery || '[]');
-            return gallery[0] && gallery[0].img || '';
-        } catch (e) {
-            return '';
-        }
-    }
-
-    function createImage(product) {
-        var photo = getPhoto(product);
-        var source = photo ? optimize(photo) : CFG.avatar;
+    function createImage(t) {
+        var source = t.photo ? optimize(t.photo) : CFG.avatar;
 
         var wrapper = document.createElement('div');
-        wrapper.className =
-            't-store__card__imgwrapper npi-teacher-card-img';
+        wrapper.className = 't-store__card__imgwrapper npi-teacher-card-img';
 
-        // Воссоздаём штатный бейдж Tilda, если он есть в товаре.
-        if (product.mark) {
+        // Воссоздаём штатный бейдж Tilda, если он есть у товара
+        if (t.mark) {
             var markWrapper = document.createElement('div');
             markWrapper.className = 't-store__card__mark-wrapper';
 
             var mark = document.createElement('div');
             mark.className = 't-store__card__mark';
-            mark.textContent = product.mark;
+            mark.textContent = t.mark;
 
             markWrapper.appendChild(mark);
             wrapper.appendChild(markWrapper);
         }
 
         var image = document.createElement('div');
-        image.className =
-            'js-product-img t-store__card__bgimg t-bgimg loaded';
-
-        image.setAttribute(
-            'data-original',
-            photo || CFG.avatar
-        );
-
-        image.style.backgroundImage =
-            'url("' + source.replace(/"/g, '\\"') + '")';
+        image.className = 'js-product-img t-store__card__bgimg t-bgimg loaded';
+        image.setAttribute('data-original', t.photo || CFG.avatar);
+        image.style.backgroundImage = 'url("' + source.replace(/"/g, '\\"') + '")';
 
         wrapper.appendChild(image);
-
         return wrapper;
     }
 
     function render() {
         renderScheduled = false;
 
-        if (!root) return;
+        var store = T.peek();
+        if (!root || !store) return;
 
-        var cards = root.querySelectorAll(CFG.card);
-
-        Array.prototype.forEach.call(cards, function (card) {
-            var link = card.querySelector(
-                '.t-store__card__wrap_all > a'
-            );
-
+        Array.prototype.forEach.call(root.querySelectorAll(CFG.card), function (card) {
+            var link = card.querySelector('.t-store__card__wrap_all > a');
             if (!link) return;
 
-            // Не вмешиваемся в штатные карточки Tilda.
-            if (link.querySelector(
-                '.t-store__card__imgwrapper:not(.npi-teacher-card-img)'
-            )) {
-                return;
-            }
-
-            if (link.querySelector('.npi-teacher-card-img')) {
-                return;
-            }
+            // Не вмешиваемся в штатные карточки Tilda и не дублируем свои
+            if (link.querySelector('.t-store__card__imgwrapper:not(.npi-teacher-card-img)')) return;
+            if (link.querySelector('.npi-teacher-card-img')) return;
 
             var uid = card.getAttribute('data-product-lid');
-            var product = uid && products[uid];
+            var t = uid && store.byUid[uid];
 
-            if (!product) return;
+            if (!t) {
+                if (uid) warn('nouid:' + uid, 'Карточка товара ' + uid + ' не найдена в данных преподавателей');
+                if (!forced) { forced = true; T.ensure(true); }   // возможно, преподавателя добавили недавно
+                return;
+            }
 
-            link.insertBefore(
-                createImage(product),
-                link.firstChild
-            );
+            link.insertBefore(createImage(t), link.firstChild);
         });
     }
 
     function scheduleRender() {
         if (renderScheduled) return;
-
         renderScheduled = true;
-
         window.requestAnimationFrame(render);
-    }
-
-    function loadProducts() {
-        fetch(CFG.api)
-            .then(function (response) {
-                if (!response.ok) {
-                    throw new Error('HTTP ' + response.status);
-                }
-
-                return response.json();
-            })
-            .then(function (data) {
-                (data.products || []).forEach(function (product) {
-                    if (product.uid) {
-                        products[String(product.uid)] = product;
-                    }
-                });
-
-                scheduleRender();
-            })
-            .catch(function (error) {
-                console.warn(
-                    '[teachers] Не удалось загрузить данные:',
-                    error
-                );
-            });
     }
 
     function init() {
         root = document.querySelector(CFG.root);
-
         if (!root) return;
 
-        var observer = new MutationObserver(scheduleRender);
+        T = window.npiplTeachers;
+        if (!T) {
+            console.warn('[teachers] Не найдено общее хранилище преподавателей (window.npiplTeachers)');
+            return;
+        }
 
-        observer.observe(root, {
-            childList: true,
-            subtree: true
+        new MutationObserver(scheduleRender).observe(root, { childList: true, subtree: true });
+
+        // Данные изменились: убираем наши картинки у изменившихся карточек, render вставит заново
+        T.onUpdate(function (store, changed) {
+            Array.prototype.forEach.call(root.querySelectorAll('.npi-teacher-card-img'), function (img) {
+                var card = img.closest(CFG.card);
+                var uid = card && card.getAttribute('data-product-lid');
+                if (uid && changed[uid]) img.parentNode.removeChild(img);
+            });
+            scheduleRender();
         });
 
-        loadProducts();
+        T.ensure();
+        scheduleRender();
     }
 
     document.addEventListener('DOMContentLoaded', function () {
         setTimeout(init, 0);
     });
-
 })();
 
 // СТРАНИЦА ПРЕПОДАВАТЕЛЯ (hero-фото, программы, хлебные крошки)
@@ -1245,12 +1400,8 @@ $(document).ready(function () {
   'use strict';
 
   var CFG = {
-    listUrl: 'https://store.tildaapi.com/api/getproductslist/?storepartuid=109845581152&getparts=true&getoptions=true&size=100&slice=1',
-    charTitle: 'Направление',   // название характеристики в карточке
-    splitter: /[,;\n]+/,        // разделитель программ внутри одного значения
     avatar: 'https://static.tildacdn.com/tild3338-6162-4631-b730-393838373161/avatar.svg',
     photoWidth: 1000,
-    cacheKey: 'teacher-data-v3',
     timeout: 2500               // мс: не дождались данных — показываем как есть
   };
 
@@ -1263,38 +1414,11 @@ $(document).ready(function () {
   }
   function flag(name) { document.documentElement.classList.add(name); }
 
-  function pickPhoto(p) {
-    var ed = p.editions && p.editions[0] && p.editions[0].img;
-    if (ed) return ed;
-    try { var g = JSON.parse(p.gallery || '[]'); return (g[0] && g[0].img) || ''; }
-    catch (e) { return ''; }
-  }
-
   function optimize(src, w) {
     var m = String(src).match(/^https?:\/\/static\.tildacdn\.com\/(.+)\/([^\/]+)$/);
     if (!m || !/\.(jpe?g|png|webp)$/i.test(m[2])) return src;
     var name = /\.webp$/i.test(m[2]) ? m[2] : m[2] + '.webp';
     return 'https://optim.tildacdn.com/' + m[1] + '/-/resize/' + w + 'x/-/format/webp/' + name;
-  }
-
-  // Карта «путь страницы → {имя, фото, направления}»
-  function buildMap(data) {
-    var map = {};
-    (data.products || []).forEach(function (p) {
-      var path = pagePath(p.url);
-      if (!path) return;
-      var dirs = [];
-      (p.characteristics || []).forEach(function (c) {
-        if (norm(c.title) === norm(CFG.charTitle)) {
-          String(c.value || '').split(CFG.splitter).forEach(function (v) {
-            v = norm(v);
-            if (v && dirs.indexOf(v) === -1) dirs.push(v);
-          });
-        }
-      });
-      map[path] = { name: p.title || '', photo: pickPhoto(p), dirs: dirs };
-    });
-    return map;
   }
 
   // Фото в hero: оптимизированное → оригинал → аватар; ставим первое, что загрузилось
@@ -1331,6 +1455,9 @@ $(document).ready(function () {
   function init() {
     var all = [].slice.call(document.querySelectorAll('.uc-programs-slider .t1196__item'));
     var holder = all.length ? all[0].parentNode : null;
+    var path = pagePath(location.href);
+    var applied = '';      // отпечаток данных, которые уже применены
+    var asked = false;
 
     function renderPrograms(dirs) {
       if (!all.length) { flag('programs-ready'); return; }
@@ -1340,36 +1467,58 @@ $(document).ready(function () {
         return dirs.some(function (d) { return title.indexOf(d) !== -1; });
       });
       if (!visible.length) {
-        console.warn('[teacher] нет совпадений для направлений:', dirs);
+        console.warn('[teacher] нет совпадений программ с опциями преподавателя, показаны все программы:', dirs);
         visible = all;
       }
-      all.forEach(function (item) { if (visible.indexOf(item) === -1) item.remove(); });
+      all.forEach(function (item) {
+        if (visible.indexOf(item) === -1 && item.parentNode) item.parentNode.removeChild(item);
+      });
       visible.forEach(function (item) { holder.appendChild(item); });
       flag('programs-ready');
       window.dispatchEvent(new Event('resize'));   // пересчёт кнопок слайдера
     }
 
-    function apply(t) { renderPrograms(t.dirs); renderPhoto(t); renderCrumbs(t); }
-    function giveUp() { flag('programs-ready'); flag('photo-ready'); flag('crumbs-ready'); }
+    function apply(t) {
+      var dirs = [];
+      t.programs.forEach(function (p) {
+        p = norm(p);
+        if (p && dirs.indexOf(p) === -1) dirs.push(p);
+      });
+      if (!dirs.length) console.warn('[teacher] у преподавателя нет опций (названий программ):', t.name);
+      renderPrograms(dirs);
+      renderPhoto(t);
+      renderCrumbs(t);
+    }
 
-    var path = pagePath(location.href);
-    var cache = {};
-    try { cache = JSON.parse(localStorage.getItem(CFG.cacheKey)) || {}; } catch (e) {}
+    function giveUp() {
+      if (!applied) console.warn('[teacher] страница не найдена среди товаров:', path);
+      flag('programs-ready'); flag('photo-ready'); flag('crumbs-ready');
+    }
+
+    function lookup(store) {
+      var t = store.byPath[path];
+      if (!t) {
+        // Возможно, преподавателя добавили недавно и в кэше его ещё нет
+        if (!asked) { asked = true; window.npiplTeachers.ensure(true); }
+        return;
+      }
+      if (t.fp === applied) return;   // уже актуально
+      applied = t.fp;
+      apply(t);
+    }
 
     setTimeout(giveUp, CFG.timeout);
 
-    if (cache[path]) apply(cache[path]);   // мгновенно из кэша
+    var T = window.npiplTeachers;
+    if (!T) {
+      console.warn('[teacher] Не найдено общее хранилище преподавателей (window.npiplTeachers)');
+      return;
+    }
 
-    fetch(CFG.listUrl)
-      .then(function (r) { return r.json(); })
-      .then(function (data) {
-        var map = buildMap(data);
-        var fresh = map[path];
-        if (!fresh) { console.warn('[teacher] страница не найдена среди товаров:', path); giveUp(); return; }
-        if (JSON.stringify(fresh) !== JSON.stringify(cache[path])) apply(fresh);
-        try { localStorage.setItem(CFG.cacheKey, JSON.stringify(map)); } catch (e) {}
-      })
-      .catch(function (e) { console.warn('[teacher] ошибка загрузки', e); giveUp(); });
+    var cached = T.peek();
+    if (cached) lookup(cached);   // мгновенно из кэша
+    T.onUpdate(lookup);
+    T.ensure();
   }
 
   document.addEventListener('DOMContentLoaded', function () {
@@ -1386,13 +1535,9 @@ $(document).ready(function () {
 
     var CFG = {
         root: '.uc-curriculum',
-        api: 'https://store.tildaapi.com/api/getproductslist/?storepartuid=109845581152&getparts=true&getoptions=true&size=100&slice=1',
         avatar: 'https://static.tildacdn.com/tild3338-6162-4631-b730-393838373161/avatar.svg',
         unavailable: '/service-unavailable',
         photoWidth: 1000,
-        cacheKey: 'feed-teachers-v1',     // при смене формата кэша увеличьте номер версии
-        ttl: 6 * 60 * 60 * 1000,          // как часто перепроверять API
-        retryDelay: 5 * 60 * 1000         // пауза после неудачного запроса
     };
 
     var CARD = 'li.js-feed-post';
@@ -1427,17 +1572,6 @@ $(document).ready(function () {
         return 'https://optim.tildacdn.com/' + m[1] + '/-/resize/' + CFG.photoWidth + 'x/-/format/webp/' + name;
     }
 
-    function getPhoto(p) {
-        var e = p.editions && p.editions[0] && p.editions[0].img;
-        if (e) return e;
-        try {
-            var g = JSON.parse(p.gallery || '[]');
-            return (g[0] && g[0].img) || '';
-        } catch (x) {
-            return '';
-        }
-    }
-
     // Абсолютная ссылка (https://, http://, //) = у товара нет личной страницы
     function resolveLink(raw) {
         raw = String(raw || '').trim();
@@ -1465,102 +1599,6 @@ $(document).ready(function () {
 
     function postFp(list) {
         return list.length ? hash(list.map(function (t) { return t.fp; }).join('|')) : 'none';
-    }
-
-    // ——— Данные и кэш ———
-
-    function parse(data) {
-        var out = [];
-
-        (data.products || []).forEach(function (p) {
-            var posts = [];
-
-            (p.properties || []).forEach(function (prop) {
-                String(prop.values || '').split(/[\r\n]+/).forEach(function (id) {
-                    id = id.trim();
-                    if (id) posts.push(id);
-                });
-            });
-
-            if (!posts.length) return;   // не привязан к постам: в кэш не берём
-
-            var name = String(p.title || '').trim();
-            if (!name) {
-                warn('noname:' + p.uid, 'У товара uid ' + p.uid + ' пустое название, преподаватель пропущен');
-                return;
-            }
-
-            var t = {
-                name: name,
-                photo: getPhoto(p),
-                descr: String(p.descr || '').trim(),   // как текст, не HTML
-                link: resolveLink(p.buttonlink || p.url),
-                posts: posts
-            };
-            t.fp = hash(JSON.stringify([t.name, t.photo, t.descr, t.link, t.posts]));
-            out.push(t);
-        });
-
-        return out;
-    }
-
-    function setData(list) {
-        index = Object.create(null);
-        list.forEach(function (t) {
-            t.posts.forEach(function (id) {
-                var a = index[id] || (index[id] = []);
-                if (a.indexOf(t) === -1) a.push(t);
-            });
-        });
-    }
-
-    function readCache() {
-        try {
-            var raw = localStorage.getItem(CFG.cacheKey);
-            if (!raw) return null;
-            var c = JSON.parse(raw);
-            return (c && Array.isArray(c.teachers)) ? c : null;
-        } catch (e) {
-            warn('cache-read', 'Не удалось прочитать кэш, данные будут загружены заново:', e);
-            return null;
-        }
-    }
-
-    function writeCache(c) {
-        try {
-            localStorage.setItem(CFG.cacheKey, JSON.stringify(c));
-        } catch (e) {
-            warn('cache-write', 'Не удалось записать кэш (localStorage недоступен?):', e);
-        }
-    }
-
-    function refresh(cache) {
-        fetch(CFG.api)
-            .then(function (r) {
-                if (!r.ok) throw new Error('HTTP ' + r.status);
-                return r.json();
-            })
-            .then(function (data) {
-                if (!data || !Array.isArray(data.products) || !data.products.length) {
-                    throw new Error('API вернул пустой список товаров');
-                }
-                return parse(data);
-            })
-            .then(function (list) {
-                if (!list.length) {
-                    warn('nolinks', 'Ни у одного преподавателя нет привязки к постам: проверьте опции товаров');
-                }
-                setData(list);
-                writeCache({ checkedAt: Date.now(), teachers: list });
-                sweep();   // перерисуются только посты, у которых изменился отпечаток
-            }, function (e) {
-                warn('fetch', 'Не удалось загрузить данные преподавателей' +
-                    (cache ? ' (используются данные из кэша):' : ':'), e);
-                if (cache) {
-                    cache.retryAt = Date.now() + CFG.retryDelay;
-                    writeCache(cache);
-                }
-            });
     }
 
     // ——— Карточка поста ———
@@ -1703,13 +1741,15 @@ $(document).ready(function () {
             content.appendChild(d);
         }
 
-        if (t.link === CFG.unavailable) {
+        var link = resolveLink(t.buttonlink || t.url);   // абсолютная ссылка = нет личной страницы
+
+        if (link === CFG.unavailable) {
             warn('nopage:' + t.name, 'У преподавателя «' + t.name + '» нет личной страницы, кнопка «Подробнее» ведёт на ' + CFG.unavailable);
         }
 
         var a = document.createElement('a');
         a.className = 't-feed__post-popup__btn t-btn btn-s btn-style-accent-ghost';
-        a.href = t.link;
+        a.href = link;
         a.innerHTML = '<span class="t-feed__post-popup__btn-text">Подробнее</span>' +
             '<svg viewBox="0 0 24 24"><path d="M15.3887 16.8193L19.4551 12.7529H2.0166V11.2529H19.4551L15.3887 7.18652L16.4492 6.125L21.7959 11.4727C21.9365 11.6133 21.9365 11.8041 21.7959 11.9447L16.4492 17.8799L15.3887 16.8193Z" fill="currentColor"></path></svg>';
         content.appendChild(a);
@@ -1820,8 +1860,14 @@ $(document).ready(function () {
         roots = findRoots();
         if (!roots.length) return;   // нет ни потоков, ни попапа поста: запросов нет
 
-        var cache = readCache();
-        if (cache) setData(cache.teachers);
+        var T = window.npiplTeachers;
+        if (!T) {
+            console.warn('[потоки] Не найдено общее хранилище преподавателей (window.npiplTeachers)');
+            return;
+        }
+
+        var cached = T.peek();
+        if (cached) index = cached.byPost;
 
         roots.forEach(function (root) {
             handle(root);
@@ -1840,10 +1886,13 @@ $(document).ready(function () {
             });
         });
 
-        var now = Date.now();
-        var stale = !cache ||
-            (now - (cache.checkedAt || 0) >= CFG.ttl && now >= (cache.retryAt || 0));
-        if (stale) refresh(cache);
+        // Данные обновились: перерисуются только посты, у которых изменился отпечаток
+        T.onUpdate(function (s) {
+            index = s.byPost;
+            sweep();
+        });
+
+        T.ensure();
     }
 
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
